@@ -23,32 +23,35 @@ object GCounter {
  * clock merge). The value of the counter is the sum of all actor counts.
  */
 case class GCounter(
-  private[crdt] val state: Map[Address, Int] = Map.empty[Address, Int])
+  private[crdt] val state: Map[Address, Long] = Map.empty[Address, Long])
   extends ConvergentReplicatedDataType {
 
   type T = GCounter
 
-  def value: Int = state.values.sum
+  def value: Long = state.values.sum
 
-  def :+(delta: Int)(implicit cluster: Cluster): GCounter = increment(cluster, delta)
+  def :+(delta: Long)(implicit cluster: Cluster): GCounter = increment(cluster, delta)
 
-  def increment(node: Cluster, delta: Int = 1): GCounter =
+  def increment(node: Cluster, delta: Long = 1): GCounter =
     increment(node.selfAddress, delta)
 
   private[crdt] def increment(key: Address): GCounter = increment(key, 1)
 
-  private[crdt] def increment(key: Address, delta: Int): GCounter = {
+  private[crdt] def increment(key: Address, delta: Long): GCounter = {
     require(delta >= 0, "Can't decrement a GCounter")
     state.get(key) match {
-      case Some(v) ⇒ copy(state = state + (key -> (v + delta)))
-      case None    ⇒ copy(state = state + (key -> delta))
+      case Some(v) ⇒
+        val tot = v + delta
+        require(tot >= 0, "Number overflow")
+        copy(state = state + (key -> tot))
+      case None ⇒ copy(state = state + (key -> delta))
     }
   }
 
   override def merge(that: GCounter): GCounter = {
     var merged = that.state
     for ((key, thisValue) ← state) {
-      val thatValue = merged.getOrElse(key, 0)
+      val thatValue = merged.getOrElse(key, 0L)
       if (thisValue > thatValue)
         merged = merged.updated(key, thisValue)
     }

@@ -19,6 +19,9 @@ import akka.cluster.ClusterEvent._
 import akka.cluster.Member
 import akka.cluster.MemberStatus
 import akka.cluster.VectorClock
+import scala.util.Try
+import scala.util.Success
+import scala.util.Failure
 
 /**
  * The [[Replicator]] actor takes care of direct replication and gossip based
@@ -44,7 +47,7 @@ import akka.cluster.VectorClock
  *     including the local replica</li>
  * <li>`WriteThree` the value will immediately be written to at least three replicas,
  *     including the local replica</li>
- * <li>`W(n)` the value will immediately be written to at least `n` replicas,
+ * <li>`WriteTo(n)` the value will immediately be written to at least `n` replicas,
  *     including the local replica</li>
  * <li>`WriteQuorum` the value will immediately be written to a majority of replicas, i.e.
  *     at least `N/2 + 1` replicas, where N is the number of nodes in the cluster
@@ -69,7 +72,7 @@ import akka.cluster.VectorClock
  *     including the local replica</li>
  * <li>`ReadThree` the value will be read and merged from three replicas,
  *     including the local replica</li>
- * <li>`R(n)` the value will be read and merged from `n` replicas,
+ * <li>`ReadFrom(n)` the value will be read and merged from `n` replicas,
  *     including the local replica</li>
  * <li>`ReadQuorum` the value will read and merged from a majority of replicas, i.e.
  *     at least `N/2 + 1` replicas, where N is the number of nodes in the cluster
@@ -94,18 +97,18 @@ object Replicator {
   // FIXME Java API props
 
   sealed trait ReadConsistency
-  object ReadOne extends R(1)
-  object ReadTwo extends R(2)
-  object ReadThree extends R(3)
-  case class R(n: Int) extends ReadConsistency
+  object ReadOne extends ReadFrom(1)
+  object ReadTwo extends ReadFrom(2)
+  object ReadThree extends ReadFrom(3)
+  case class ReadFrom(n: Int) extends ReadConsistency
   case object ReadQuorum extends ReadConsistency
   case object ReadAll extends ReadConsistency
 
   sealed trait WriteConsistency
-  object WriteOne extends W(1)
-  object WriteTwo extends W(2)
-  object WriteThree extends W(3)
-  case class W(n: Int) extends WriteConsistency
+  object WriteOne extends WriteTo(1)
+  object WriteTwo extends WriteTo(2)
+  object WriteThree extends WriteTo(3)
+  case class WriteTo(n: Int) extends WriteConsistency
   case object WriteQuorum extends WriteConsistency
   case object WriteAll extends WriteConsistency
 
@@ -118,7 +121,12 @@ object Replicator {
   case class Update(key: String, crdt: ConvergentReplicatedDataType, consistency: WriteConsistency,
                     timeout: FiniteDuration, correlationId: Any)
   case class UpdateSuccess(key: String, correlationId: Any)
-  case class UpdateFailure(key: String, correlationId: Any)
+  sealed trait UpdateFailure {
+    def key: String
+    def correlationId: Any
+  }
+  case class ReplicationFailure(key: String, correlationId: Any) extends UpdateFailure
+  case class ConflictingType(key: String, correlationId: Any, errorMessage: String) extends UpdateFailure
 
   /**
    * INTERNAL API
@@ -204,11 +212,15 @@ class Replicator(
       sender() ! ReadResult(crdts.get(key))
 
     case Update(key, crdt, consistency, timeout, correlationId) ⇒
-      val merged = change(key, crdt)
-      if (consistency == WriteOne)
-        sender() ! UpdateSuccess(key, correlationId)
-      else
-        context.actorOf(Props(classOf[WriteAggregator], key, merged, consistency, timeout, correlationId, nodes, sender()))
+      change(key, crdt) match {
+        case Success(merged) ⇒
+          if (consistency == WriteOne)
+            sender() ! UpdateSuccess(key, correlationId)
+          else
+            context.actorOf(Props(classOf[WriteAggregator], key, merged, consistency, timeout, correlationId, nodes, sender()))
+        case Failure(e) ⇒
+          sender() ! ConflictingType(key, correlationId, e.getMessage)
+      }
 
     case Write(key, vCrdt) ⇒
       write(key, vCrdt)
@@ -275,22 +287,22 @@ class Replicator(
       sender() ! NodeCount(nodes.size + 1)
   }
 
-  def change(key: String, crdt: ConvergentReplicatedDataType): VersionedCrdt =
+  def change(key: String, crdt: ConvergentReplicatedDataType): Try[VersionedCrdt] =
     crdts.get(key) match {
       case Some(vCrdt @ VersionedCrdt(existing, v)) ⇒
         if (existing.getClass == crdt.getClass) {
           val merged = VersionedCrdt(crdt merge existing.asInstanceOf[crdt.T], v :+ vclockNode)
           crdts = crdts.updated(key, merged)
-          merged
+          Success(merged)
         } else {
-          log.warning("Wrong type for updating [{}], existing type [{}], got [{}]",
-            key, existing.getClass.getName, crdt.getClass.getName)
-          vCrdt
+          val errMsg = s"Wrong type for updating [$key], existing type [${existing.getClass.getName}], got [${crdt.getClass.getName}]"
+          log.warning(errMsg)
+          Failure(new RuntimeException(errMsg))
         }
       case None ⇒
         val vCrdt = VersionedCrdt(crdt, new VectorClock :+ vclockNode)
         crdts = crdts.updated(key, vCrdt)
-        vCrdt
+        Success(vCrdt)
     }
 
   def write(key: String, writeCrdt: VersionedCrdt): Unit =
@@ -376,8 +388,8 @@ private[akka] class WriteAggregator(
   import Replicator.Internal._
 
   val doneWhenRemainingSize = consistency match {
-    case W(n)     ⇒ nodes.size - (n - 1)
-    case WriteAll ⇒ 0
+    case WriteTo(n) ⇒ nodes.size - (n - 1)
+    case WriteAll   ⇒ 0
     case WriteQuorum ⇒
       val N = nodes.size + 1
       if (N < 3) -1
@@ -410,7 +422,7 @@ private[akka] class WriteAggregator(
     if (ok)
       replyTo.tell(UpdateSuccess(key, correlationId), context.parent)
     else
-      replyTo.tell(UpdateFailure(key, correlationId), context.parent)
+      replyTo.tell(ReplicationFailure(key, correlationId), context.parent)
     becomeDone()
   }
 }
@@ -431,8 +443,8 @@ private[akka] class ReadAggregator(
 
   var result = localValue
   val doneWhenRemainingSize = consistency match {
-    case R(n)    ⇒ nodes.size - (n - 1)
-    case ReadAll ⇒ 0
+    case ReadFrom(n) ⇒ nodes.size - (n - 1)
+    case ReadAll     ⇒ 0
     case ReadQuorum ⇒
       val N = nodes.size + 1
       if (N < 3) -1

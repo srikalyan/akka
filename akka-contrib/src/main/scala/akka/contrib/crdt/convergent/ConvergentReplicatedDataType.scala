@@ -17,6 +17,9 @@ trait ConvergentReplicatedDataType {
  * Java.
  */
 abstract class ConvergentReplicatedDataTypeBase extends ConvergentReplicatedDataType {
+  // it is not possible to use a more strict type, because it is erased somehow, and 
+  // the implementation is anyway required to implement
+  // merge(that: ConvergentReplicatedDataType): ConvergentReplicatedDataType
   type T = ConvergentReplicatedDataTypeBase
 
 }

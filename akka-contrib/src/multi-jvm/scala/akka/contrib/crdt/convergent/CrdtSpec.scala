@@ -76,14 +76,14 @@ class CrdtSpec extends MultiNodeSpec(CrdtSpec) with STMultiNodeSpec with Implici
         val c4 = c3 :+ 1
         // too strong consistency level
         replicator ! Update("A", c4, WriteTwo, timeout, 2)
-        expectMsg(UpdateFailure("A", 2))
+        expectMsg(ReplicationFailure("A", 2))
         replicator ! Get("A", ReadOne, timeout)
         expectMsg(GetResult("A", c4))
 
         val c5 = c4 :+ 1
         // too strong consistency level
         replicator ! Update("A", c5, WriteQuorum, timeout, 3)
-        expectMsg(UpdateFailure("A", 3))
+        expectMsg(ReplicationFailure("A", 3))
         replicator ! Get("A", ReadOne, timeout)
         expectMsg(GetResult("A", c5))
 
@@ -235,10 +235,10 @@ class CrdtSpec extends MultiNodeSpec(CrdtSpec) with STMultiNodeSpec with Implici
       c40.value should be(40)
       val c41 = c40 :+ 1
       replicator ! Update("D", c41, WriteTwo, timeout, 2)
-      expectMsg(UpdateFailure("D", 2))
+      expectMsg(ReplicationFailure("D", 2))
       val c42 = c41 :+ 1
       replicator ! Update("D", c42, WriteTwo, timeout, 3)
-      expectMsg(UpdateFailure("D", 3))
+      expectMsg(ReplicationFailure("D", 3))
     }
     enterBarrier("updates-during-partion")
 
